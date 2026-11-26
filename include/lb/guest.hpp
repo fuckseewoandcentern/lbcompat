@@ -78,4 +78,8 @@ const TranslatedBlock* dbt_translate(uint64_t pc);
 
 void dbt_reset();
 
+// Ask translators to leave the code cache. Guest threads must observe this
+// before the process tears the cache down.
+void dbt_request_shutdown();
+
 }  // namespace lb
