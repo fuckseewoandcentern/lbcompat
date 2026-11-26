@@ -274,6 +274,41 @@ struct ThreadStart {
 
 void install_handler();
 
+struct GuestThread {
+    pthread_t th{};
+    Guest* guest = nullptr;
+};
+
+std::mutex g_thr_mu;
+std::vector<GuestThread> g_guest_threads;
+
+void note_guest_thread(pthread_t th, Guest* guest) {
+    std::lock_guard<std::mutex> lock(g_thr_mu);
+    g_guest_threads.push_back(GuestThread{th, guest});
+}
+
+void forget_guest_thread(pthread_t th) {
+    std::lock_guard<std::mutex> lock(g_thr_mu);
+    std::erase_if(g_guest_threads, [&](const GuestThread& t) { return pthread_equal(t.th, th); });
+}
+
+void stop_guest_threads() {
+    dbt_request_shutdown();
+    std::vector<GuestThread> copy;
+    {
+        std::lock_guard<std::mutex> lock(g_thr_mu);
+        for (GuestThread& t : g_guest_threads)
+            if (t.guest) t.guest->stop = 1;
+        copy = g_guest_threads;
+    }
+    for (GuestThread& t : copy) {
+        if (pthread_equal(t.th, pthread_self())) continue;
+        pthread_join(t.th, nullptr);
+    }
+    std::lock_guard<std::mutex> lock(g_thr_mu);
+    g_guest_threads.clear();
+}
+
 void* thread_tramp(void* raw) {
     auto* t = static_cast<ThreadStart*>(raw);
     Guest g;
@@ -281,17 +316,20 @@ void* thread_tramp(void* raw) {
     g.x[0] = t->arg;
     g.x[30] = g_exit_shim;
     g.sp = t->stack;
+    note_guest_thread(pthread_self(), &g);
     install_handler();
     g_cur = &g;
     if (sigsetjmp(g_jmp, 1) != 0) {
         g_armed = 0;
         std::fprintf(stderr, "guest thread fault pc=0x%llx\n", static_cast<unsigned long long>(g_fault_pc));
+        forget_guest_thread(pthread_self());
         delete t;
         return nullptr;
     }
     g_armed = 1;
     dbt_run(g, 50000000);
     g_armed = 0;
+    forget_guest_thread(pthread_self());
     delete t;
     return reinterpret_cast<void*>(g.x[0]);
 }
@@ -1321,6 +1359,21 @@ void sh_pthread_once(Guest& g) {
     g.x[0] = 0;
 }
 
+void sh_call_once(Guest& g) {
+    // libc++ __call_once(flag, arg, func). A finished flag is all-ones.
+    uint64_t flag_at = tbi(g.x[0]);
+    uint64_t func = g.x[2];
+    g.x[0] = 0;
+    if (flag_at < 0x10000 || !func) return;
+    uint64_t flag = 0;
+    std::memcpy(&flag, reinterpret_cast<void*>(flag_at), 8);
+    if (flag == ~0ull) return;
+    call_guest(func, g.x[1], 0, 0, 0, &g);
+    flag = ~0ull;
+    std::memcpy(reinterpret_cast<void*>(flag_at), &flag, 8);
+    g.x[0] = 0;
+}
+
 void sh_setjmp(Guest& g) {
     JmpSave s;
     s.g = g;
@@ -2134,6 +2187,7 @@ void register_libc() {
     register_shim("_getsectiondata", sh_getsectiondata);
     register_shim("___cxa_atexit", sh_cxa_atexit);
     register_shim("_atexit", sh_ret0);
+    register_shim("__ZNSt3__111__call_onceERVmPvPFvS2_E", sh_call_once);
     register_shim("___cxa_guard_acquire", sh_guard_acq);
     register_shim("___cxa_guard_release", sh_guard_rel);
     register_shim("___cxa_guard_abort", sh_guard_abort);
@@ -2835,6 +2889,9 @@ uint64_t Runtime::run(Guest& g, uint64_t max_insns) {
         for (const auto& s : missed_selectors()) std::fprintf(stderr, " %s", s.c_str());
         std::fprintf(stderr, "\n");
     }
+    // Join guest threads before main destroys the runtime. Otherwise a
+    // translator is still in the code cache when the process exits.
+    stop_guest_threads();
     return n;
 }
 

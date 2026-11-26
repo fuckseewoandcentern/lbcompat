@@ -1,6 +1,7 @@
 #include "lb/guest.hpp"
 #include "x86.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -147,9 +148,16 @@ struct Cache {
     std::vector<void*> pages;
 };
 
+std::atomic<int> g_dbt_shutdown{0};
+
+bool dbt_stopping() { return g_dbt_shutdown.load(std::memory_order_acquire) != 0; }
+
 Cache& cache() {
-    static Cache c;
-    return c;
+    // The cache lives for the whole process. A function-local Cache is
+    // destroyed during exit while a guest thread can still be inside
+    // dbt_translate, and that free aborts with a corrupted heap list.
+    static Cache* c = new Cache;
+    return *c;
 }
 
 TranslatedBlock compile_block(uint64_t pc) {
@@ -231,9 +239,13 @@ TranslatedBlock compile_block(uint64_t pc) {
 
 }  // namespace
 
+void dbt_request_shutdown() { g_dbt_shutdown.store(1, std::memory_order_release); }
+
 const TranslatedBlock* dbt_translate(uint64_t pc) {
+    if (dbt_stopping()) return nullptr;
     Cache& c = cache();
     std::lock_guard<std::mutex> lock(c.mu);
+    if (dbt_stopping()) return nullptr;
     auto it = c.index.find(pc);
     if (it != c.index.end()) return it->second;
     c.blocks.push_back(compile_block(pc));
@@ -248,7 +260,7 @@ extern "C" bool lb_try_shim(Guest* g) __attribute__((weak));
 
 uint64_t dbt_run(Guest& g, uint64_t max_insns) {
     uint64_t start = g.steps;
-    while (!g.stop && g.steps - start < max_insns) {
+    while (!g.stop && !dbt_stopping() && g.steps - start < max_insns) {
         if (lb_try_shim && lb_try_shim(&g)) continue;
         const TranslatedBlock* b = dbt_translate(g.pc);
         if (!b || !b->fn || b->count <= 0) {
