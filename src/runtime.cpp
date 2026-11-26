@@ -410,9 +410,13 @@ struct GetArea {
     uint64_t egptr;
 };
 
+bool guest_mapped(uint64_t addr, size_t n);
+std::map<uint64_t, FILE*> g_files;
+
 uint64_t filebuf_vtable() {
     uint64_t vt = make_vtable("__ZTVNSt3__113basic_filebufIcNS_11char_traitsIcEEEE");
-    reinterpret_cast<uint64_t*>(vt)[12] = resolve_symbol("___lb_streambuf_eof", 0);
+    auto* slots = reinterpret_cast<uint64_t*>(vt);
+    slots[12] = resolve_symbol("___lb_streambuf_eof", 0);
     return vt;
 }
 
@@ -553,6 +557,14 @@ void sh_filebuf_open(Guest& g) {
     else if (out || trunc) how = "wb";
     else if (in) how = "rb";
     std::string opened = path ? path : "";
+    auto mkdir_parents = [](const std::string& file) {
+        std::string cur;
+        for (size_t i = 0; i < file.size(); ++i) {
+            if (file[i] == '/' && cur.size() > 1) ::mkdir(cur.c_str(), 0755);
+            cur.push_back(file[i]);
+        }
+    };
+    if (!opened.empty()) mkdir_parents(opened);
     FILE* f = (!opened.empty()) ? std::fopen(opened.c_str(), how) : nullptr;
     if (!f && !opened.empty() && opened.size() >= 11 && opened.compare(opened.size() - 11, 11, "config.json") == 0) {
         // The app throws if its settings file is missing. A small JSON document
@@ -606,6 +618,391 @@ void sh_filebuf_open(Guest& g) {
     write_u64(g.x[0] + 24, area);
     write_u64(g.x[0] + 32, area);
 }
+
+void sh_filebuf_xsputn(Guest& g) {
+    auto it = g_files.find(g.x[0]);
+    FILE* f = it == g_files.end() ? nullptr : it->second;
+    uint64_t n = g.x[2];
+    if (f && g.x[1] > 0x10000 && n > 0 && n < (1u << 20) && guest_mapped(g.x[1], static_cast<size_t>(n))) {
+        g.x[0] = std::fwrite(reinterpret_cast<void*>(tbi(g.x[1])), 1, static_cast<size_t>(n), f);
+        std::fflush(f);
+        return;
+    }
+    if (f && g.x[1] < 0x10000) {
+        unsigned char c = static_cast<unsigned char>(g.x[1]);
+        std::fputc(c, f);
+        std::fflush(f);
+        g.x[0] = c;
+        return;
+    }
+    g.x[0] = n ? n : 1;
+}
+
+void sh_nop(Guest&) {}
+
+bool guest_string_long(const uint8_t raw[24]) { return (raw[23] & 0x80) != 0; }
+
+bool guest_mapped(uint64_t addr, size_t n) {
+    addr = tbi(addr);
+    if (addr < 0x10000 || n == 0) return false;
+    uintptr_t page = addr & ~uintptr_t{0xfff};
+    uintptr_t last = (addr + n - 1) & ~uintptr_t{0xfff};
+    for (uintptr_t p = page; p <= last; p += 4096) {
+        unsigned char vec = 0;
+        if (mincore(reinterpret_cast<void*>(p), 4096, &vec) != 0 || (vec & 1) == 0) return false;
+    }
+    return true;
+}
+
+std::string read_guest_string(uint64_t obj) {
+    obj = tbi(obj);
+    if (!guest_mapped(obj, 24)) return {};
+    uint8_t raw[24]{};
+    std::memcpy(raw, reinterpret_cast<void*>(obj), 24);
+    if (!guest_string_long(raw)) {
+        size_t n = raw[23];
+        if (n > 22) return {};
+        return std::string(reinterpret_cast<char*>(raw), n);
+    }
+    uint64_t ptr = 0, sz = 0;
+    std::memcpy(&ptr, raw, 8);
+    std::memcpy(&sz, raw + 8, 8);
+    ptr = tbi(ptr);
+    if (!guest_mapped(ptr, static_cast<size_t>(sz > (1u << 20) ? 0 : sz == 0 ? 1 : sz)) || sz > (1u << 20)) return {};
+    return std::string(reinterpret_cast<char*>(ptr), static_cast<size_t>(sz));
+}
+
+void write_guest_string(uint64_t obj, const std::string& s) {
+    obj = tbi(obj);
+    if (!guest_mapped(obj, 24)) return;
+    uint8_t raw[24]{};
+    if (s.size() <= 22) {
+        if (!s.empty()) std::memcpy(raw, s.data(), s.size());
+        raw[23] = static_cast<uint8_t>(s.size());
+    } else {
+        auto* buf = static_cast<char*>(std::malloc(s.size() + 1));
+        std::memcpy(buf, s.data(), s.size());
+        buf[s.size()] = 0;
+        uint64_t ptr = reinterpret_cast<uint64_t>(buf);
+        uint64_t sz = s.size();
+        uint64_t cap = (sz + 1) | (1ull << 63);
+        std::memcpy(raw, &ptr, 8);
+        std::memcpy(raw + 8, &sz, 8);
+        std::memcpy(raw + 16, &cap, 8);
+    }
+    std::memcpy(reinterpret_cast<void*>(obj), raw, 24);
+}
+
+void sh_to_string(Guest& g, bool hex_unsigned) {
+    char buf[32];
+    if (hex_unsigned) std::snprintf(buf, sizeof buf, "%llu", static_cast<unsigned long long>(g.x[0]));
+    else std::snprintf(buf, sizeof buf, "%d", static_cast<int>(g.x[0]));
+    if (guest_mapped(g.x[8], 24)) write_guest_string(g.x[8], buf);
+}
+
+void sh_runtime_error(Guest& g) {
+    if (!guest_mapped(g.x[1], 1)) return;
+    const char* msg = reinterpret_cast<const char*>(tbi(g.x[1]));
+    if (msg[0] < 32 || msg[0] >= 127) return;
+    std::fprintf(stderr, "runtime_error: %s\n", msg);
+}
+
+void sh_runtime_error_copy(Guest&) {}
+
+void sh_to_string_int(Guest& g) { sh_to_string(g, false); }
+void sh_to_string_ulong(Guest& g) { sh_to_string(g, true); }
+
+void sh_string_push(Guest& g) {
+    if (g.x[0] < 0x10000) return;
+    std::string s = read_guest_string(g.x[0]);
+    s.push_back(static_cast<char>(g.x[1]));
+    write_guest_string(g.x[0], s);
+}
+
+void sh_steady_now(Guest& g) {
+    timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g.x[0] = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+void sh_fs_status(Guest& g) {
+    std::string path = read_guest_string(g.x[0]);
+    struct stat st {};
+    int8_t type = -1;
+    uint32_t perms = 0;
+    if (!path.empty() && ::stat(path.c_str(), &st) == 0) {
+        if (S_ISREG(st.st_mode)) type = 1;
+        else if (S_ISDIR(st.st_mode)) type = 2;
+        else if (S_ISLNK(st.st_mode)) type = 3;
+        else type = 8;
+        perms = static_cast<uint32_t>(st.st_mode) & 0777u;
+    }
+    uint64_t word = static_cast<uint32_t>(type);
+    word |= static_cast<uint64_t>(perms) << 32;
+    g.x[0] = word;
+    if (g.x[8] > 0x10000) std::memcpy(reinterpret_cast<void*>(tbi(g.x[8])), &word, 8);
+    if (g.x[1] > 0x10000) {
+        int32_t zero = 0;
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[1])), &zero, 4);
+    }
+}
+
+void sh_fs_cwd(Guest& g) {
+    char buf[4096];
+    if (!::getcwd(buf, sizeof buf)) std::snprintf(buf, sizeof buf, "/tmp");
+    if (g.x[8] > 0x10000) write_guest_string(g.x[8], buf);
+    if (g.x[0] > 0x10000) {
+        int32_t zero = 0;
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[0])), &zero, 4);
+    }
+}
+
+void sh_fs_root(Guest& g) {
+    std::string path = read_guest_string(g.x[0]);
+    if (g.x[8] > 0x10000) write_guest_string(g.x[8], (!path.empty() && path[0] == '/') ? "/" : "");
+}
+
+void sh_fs_parent(Guest& g) {
+    std::string path = read_guest_string(g.x[0]);
+    std::string parent;
+    auto slash = path.find_last_of('/');
+    if (slash != std::string::npos) parent = slash == 0 ? "/" : path.substr(0, slash);
+    if (g.x[8] > 0x10000) write_guest_string(g.x[8], parent);
+}
+
+void sh_fs_mkdirs(Guest& g) {
+    std::string path = read_guest_string(g.x[0]);
+    std::string cur;
+    for (size_t i = 0; i < path.size(); ++i) {
+        cur.push_back(path[i]);
+        if ((path[i] == '/' || i + 1 == path.size()) && cur.size() > 1) ::mkdir(cur.c_str(), 0755);
+    }
+    if (g.x[1] > 0x10000 && guest_mapped(g.x[1], 4)) {
+        int32_t zero = 0;
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[1])), &zero, 4);
+    }
+    g.x[0] = 1;
+}
+
+void sh_fs_rename(Guest& g) {
+    std::string from = read_guest_string(g.x[0]);
+    std::string to = read_guest_string(g.x[1]);
+    if (!from.empty() && !to.empty()) {
+        struct stat src {}, dst {};
+        bool src_ok = ::stat(from.c_str(), &src) == 0;
+        bool dst_ok = ::stat(to.c_str(), &dst) == 0;
+        // An empty temporary must not replace a file that already has contents.
+        if (!(src_ok && src.st_size == 0 && dst_ok && dst.st_size > 0)) ::rename(from.c_str(), to.c_str());
+    }
+    if (g.x[2] > 0x10000 && guest_mapped(g.x[2], 4)) {
+        int32_t zero = 0;
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[2])), &zero, 4);
+    }
+    g.x[0] = 0;
+}
+
+void sh_string_grow(Guest& g) {
+    std::string old = read_guest_string(g.x[0]);
+    size_t n_copy = static_cast<size_t>(g.x[4]);
+    size_t n_del = static_cast<size_t>(g.x[5]);
+    size_t n_add = static_cast<size_t>(g.x[6]);
+    if (n_copy > old.size()) n_copy = old.size();
+    if (n_add > (1u << 20)) n_add = 0;
+    std::string neu = old.substr(0, n_copy);
+    if (n_add && g.x[7] > 0x10000 && guest_mapped(g.x[7], n_add))
+        neu.append(reinterpret_cast<char*>(tbi(g.x[7])), n_add);
+    size_t tail = n_copy + n_del;
+    if (tail < old.size()) neu.append(old, tail, std::string::npos);
+    write_guest_string(g.x[0], neu);
+}
+
+void sh_system_category(Guest& g) {
+    static uint64_t cat = 0;
+    if (!cat) {
+        uint64_t vt = make_vtable("__ZTVNSt3__114error_categoryE");
+        uint64_t nop = resolve_symbol("__lb_nop", 0);
+        auto* slots = reinterpret_cast<uint64_t*>(vt);
+        for (int i = 2; i < 16; ++i) slots[i] = nop;
+        cat = reinterpret_cast<uint64_t>(std::calloc(1, 32));
+        write_u64(cat, vt + 16);
+    }
+    g.x[0] = cat;
+}
+
+void sh_sentry_ctor(Guest& g) {
+    if (guest_mapped(g.x[0], 16)) {
+        uint8_t ok = 1;
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[0])), &ok, 1);
+    }
+}
+
+std::map<uint64_t, int64_t> g_stream_pos;
+
+struct HostArray;
+HostArray* as_array(uint64_t p);
+uint64_t host_array(std::initializer_list<uint64_t> items);
+
+void sh_seekg(Guest& g) {
+    int64_t off = static_cast<int64_t>(g.x[1]);
+    int dir = static_cast<int>(g.x[2]);
+    int64_t cur = g_stream_pos[g.x[0]];
+    uint64_t area = 0;
+    if (g.x[0] > 0x10000) {
+        area = read_u64(g.x[0] + 24);
+        if (area < 0x10000) area = read_u64(g.x[0] + 40);
+    }
+    int64_t len = 0;
+    uint64_t base = 0;
+    if (area > 0x10000) {
+        base = read_u64(area + 16);
+        uint64_t end = read_u64(area + 32);
+        if (end >= base) len = static_cast<int64_t>(end - base);
+    }
+    int64_t pos = dir == 0 ? off : dir == 2 ? len + off : cur + off;
+    if (pos < 0) pos = 0;
+    if (len && pos > len) pos = len;
+    g_stream_pos[g.x[0]] = pos;
+    if (area > 0x10000 && base) write_u64(area + 24, base + static_cast<uint64_t>(pos));
+}
+
+void sh_tellg(Guest& g) {
+    int64_t pos = g_stream_pos[g.x[0]];
+    g.x[0] = static_cast<uint64_t>(pos);
+    if (g.x[8] > 0x10000) {
+        uint64_t buf[2] = {static_cast<uint64_t>(pos), 0};
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[8])), buf, sizeof buf);
+    }
+}
+
+uint64_t cf_dict() {
+    uint64_t o = make_object("NSDictionary");
+    payload(o).kind = 3;
+    return o;
+}
+
+uint64_t cf_font() {
+    uint64_t o = make_object("NSFont");
+    payload(o).kind = 8;
+    payload(o).str = "sans";
+    return o;
+}
+
+std::string cf_text(uint64_t obj) {
+    if (has_payload(obj)) return payload(obj).str;
+    return {};
+}
+
+void sh_cf_get_type(Guest& g) {
+    if (as_array(g.x[0])) {
+        g.x[0] = 5;
+        return;
+    }
+    if (!has_payload(g.x[0])) {
+        g.x[0] = 0;
+        return;
+    }
+    int k = payload(g.x[0]).kind;
+    g.x[0] = k == 0 ? 1 : static_cast<uint64_t>(k);
+}
+
+void sh_cf_dict_type(Guest& g) { g.x[0] = 3; }
+
+void sh_cf_dict_new(Guest& g) { g.x[0] = cf_dict(); }
+
+void sh_cf_dict_add(Guest& g) {
+    if (!has_payload(g.x[0])) return;
+    payload(g.x[0]).props[cf_text(g.x[1])] = g.x[2];
+}
+
+void sh_cf_dict_get(Guest& g) {
+    uint64_t dict = g.x[0];
+    uint64_t key = g.x[1];
+    uint64_t out = g.x[2];
+    g.x[0] = 0;
+    if (!has_payload(dict)) return;
+    auto it = payload(dict).props.find(cf_text(key));
+    if (it == payload(dict).props.end()) return;
+    if (out > 0x10000) write_u64(out, it->second);
+    g.x[0] = 1;
+}
+
+void sh_cf_number(Guest& g) {
+    int64_t v = 0;
+    if (g.x[2] > 0x10000) std::memcpy(&v, reinterpret_cast<void*>(tbi(g.x[2])), 8);
+    uint64_t o = make_object("NSNumber");
+    payload(o).kind = 4;
+    payload(o).number = static_cast<double>(v);
+    g.x[0] = o;
+}
+
+void sh_cf_data_create(Guest& g) {
+    uint64_t n = g.x[2];
+    if (n > (1u << 20)) n = 0;
+    auto* buf = static_cast<uint8_t*>(std::malloc(n + 1));
+    if (n && g.x[1] > 0x10000) std::memcpy(buf, reinterpret_cast<void*>(tbi(g.x[1])), n);
+    buf[n] = 0;
+    uint64_t o = make_object("NSData");
+    payload(o).kind = 2;
+    payload(o).props["ptr"] = reinterpret_cast<uint64_t>(buf);
+    payload(o).props["len"] = n;
+    g.x[0] = o;
+}
+
+void sh_cf_data_ptr(Guest& g) {
+    g.x[0] = has_payload(g.x[0]) ? payload(g.x[0]).props["ptr"] : 0;
+}
+
+void sh_cf_set_create(Guest& g) {
+    uint64_t o = make_object("NSSet");
+    payload(o).kind = 6;
+    g.x[0] = o;
+}
+
+void sh_cf_string_cmp(Guest& g) {
+    std::string a = cf_text(g.x[0]);
+    std::string b = cf_text(g.x[1]);
+    g.x[0] = a < b ? ~0ull : a > b ? 1 : 0;
+}
+
+void sh_cf_url(Guest& g) {
+    uint64_t o = make_string(cf_text(g.x[1]));
+    payload(o).kind = 7;
+    g.x[0] = o;
+}
+
+void sh_cf_url_path(Guest& g) {
+    std::string path = cf_text(g.x[0]);
+    if (path.empty()) path = "/tmp/lyricsblossom-data";
+    if (g.x[2] > 0x10000 && g.x[3] > path.size()) {
+        std::memcpy(reinterpret_cast<void*>(tbi(g.x[2])), path.c_str(), path.size() + 1);
+        g.x[0] = 1;
+    } else {
+        g.x[0] = 0;
+    }
+}
+
+void sh_cf_resources_url(Guest& g) {
+    g.x[0] = make_string("/tmp/lyricsblossom-data");
+    payload(g.x[0]).kind = 7;
+}
+
+void sh_cf_languages(Guest& g) { g.x[0] = host_array({make_string("zh-Hans"), make_string("en")}); }
+
+void sh_ct_font(Guest& g) { g.x[0] = cf_font(); }
+
+void sh_ct_families(Guest& g) {
+    g.x[0] = host_array({make_string("sans"), make_string("PingFang SC"), make_string("Helvetica")});
+}
+
+void sh_ct_traits(Guest& g) { g.x[0] = 0; }
+
+void sh_ct_register(Guest& g) { g.x[0] = 1; }
+
+void sh_iopm(Guest& g) { g.x[0] = 0; }
+
+void sh_display_service(Guest& g) { g.x[0] = 1; }
+
+void sh_display_info(Guest& g) { g.x[0] = cf_dict(); }
 
 void sh_thread_local_data(Guest& g) {
     static uint8_t* page = nullptr;
@@ -1840,6 +2237,11 @@ void sh_cfarray_at(Guest& g) {
     uint64_t i = g.x[1];
     g.x[0] = (a && i < a->count) ? a->items[i] : 0;
 }
+void sh_cf_array_append(Guest& g) {
+    HostArray* a = as_array(g.x[0]);
+    if (!a || a->count >= 8) return;
+    a->items[a->count++] = g.x[1];
+}
 void sh_cfarray_create(Guest& g) {
     uint64_t values = g.x[1];
     uint64_t n = g.x[2];
@@ -2401,6 +2803,7 @@ void register_libc() {
     register_shim("_setlocale", sh_ret0);
     register_shim("_localeconv", sh_localeconv);
     register_shim("___lb_streambuf_eof", sh_streambuf_eof);
+    register_shim("___lb_filebuf_xsputn", sh_filebuf_xsputn);
     register_shim("__ZNSt3__112__next_primeEm", sh_next_prime);
     register_shim("__ZNSt3__16localeC1Ev", sh_locale_ctor);
     register_shim("__ZNSt3__16localeC2Ev", sh_locale_ctor);
@@ -2415,6 +2818,67 @@ void register_libc() {
     register_shim("__ZNSt3__18ios_base5clearEj", sh_ios_clear);
     register_shim("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev", sh_filebuf_ctor);
     register_shim("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj", sh_filebuf_open);
+    register_shim("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEED1Ev", sh_nop);
+    register_shim("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev", sh_nop);
+    register_shim("__ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev", sh_nop);
+    register_shim("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc", sh_string_push);
+    register_shim("__ZNSt13runtime_errorC1EPKc", sh_runtime_error);
+    register_shim("__ZNSt13runtime_errorC1ERKS_", sh_runtime_error_copy);
+    register_shim("__ZNSt3__19to_stringEi", sh_to_string_int);
+    register_shim("__ZNSt3__19to_stringEm", sh_to_string_ulong);
+    register_shim("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base7seekdirE", sh_seekg);
+    register_shim("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv", sh_tellg);
+    register_shim("__ZNSt3__16chrono12steady_clock3nowEv", sh_steady_now);
+    register_shim("__ZNSt3__15mutex4lockEv", sh_nop);
+    register_shim("__ZNSt3__15mutex6unlockEv", sh_nop);
+    register_shim("__ZNSt3__115recursive_mutexC1Ev", sh_nop);
+    register_shim("__ZNSt3__115recursive_mutex4lockEv", sh_nop);
+    register_shim("__ZNSt3__115recursive_mutex6unlockEv", sh_nop);
+    register_shim("__ZNSt3__115__thread_structC1Ev", sh_nop);
+    register_shim("__ZNSt3__16thread6detachEv", sh_nop);
+    register_shim("__ZNSt3__16threadD1Ev", sh_nop);
+    register_shim("__ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE", sh_fs_status);
+    register_shim("__ZNSt3__14__fs10filesystem14__current_pathEPNS_10error_codeE", sh_fs_cwd);
+    register_shim("__ZNKSt3__14__fs10filesystem4path16__root_directoryEv", sh_fs_root);
+    register_shim("__ZNKSt3__14__fs10filesystem4path13__parent_pathEv", sh_fs_parent);
+    register_shim("__ZNSt3__14__fs10filesystem20__create_directoriesERKNS1_4pathEPNS_10error_codeE", sh_fs_mkdirs);
+    register_shim("__ZNSt3__14__fs10filesystem8__renameERKNS1_4pathES4_PNS_10error_codeE", sh_fs_rename);
+    register_shim("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE21__grow_by_and_replaceEmmmmmmPKc", sh_string_grow);
+    register_shim("__ZNSt3__115system_categoryEv", sh_system_category);
+    register_shim("__ZNSt3__119__shared_weak_count14__release_weakEv", sh_nop);
+    register_shim("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", sh_sentry_ctor);
+    register_shim("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev", sh_nop);
+    register_shim("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE5flushEv", sh_nop);
+    register_shim("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEED2Ev", sh_nop);
+    register_shim("__lb_nop", sh_nop);
+    register_shim("_CFStringCompare", sh_cf_string_cmp);
+    register_shim("_CFArrayAppendValue", sh_cf_array_append);
+    register_shim("_CFDataGetBytePtr", sh_cf_data_ptr);
+    register_shim("_CFDataCreate", sh_cf_data_create);
+    register_shim("_CFDictionaryCreateMutable", sh_cf_dict_new);
+    register_shim("_CFDictionaryAddValue", sh_cf_dict_add);
+    register_shim("_CFDictionaryGetValueIfPresent", sh_cf_dict_get);
+    register_shim("_CFDictionaryGetTypeID", sh_cf_dict_type);
+    register_shim("_CFGetTypeID", sh_cf_get_type);
+    register_shim("_CFNumberCreate", sh_cf_number);
+    register_shim("_CFSetCreate", sh_cf_set_create);
+    register_shim("_CFURLCreateWithFileSystemPath", sh_cf_url);
+    register_shim("_CFURLGetFileSystemRepresentation", sh_cf_url_path);
+    register_shim("_CFBundleCopyResourcesDirectoryURL", sh_cf_resources_url);
+    register_shim("_CFLocaleCopyPreferredLanguages", sh_cf_languages);
+    register_shim("_CTFontDescriptorCreateWithAttributes", sh_ct_font);
+    register_shim("_CTFontDescriptorCreateMatchingFontDescriptor", sh_ct_font);
+    register_shim("_CTFontCreateWithFontDescriptor", sh_ct_font);
+    register_shim("_CTFontCopyFontDescriptor", sh_ct_font);
+    register_shim("_CTFontDescriptorCopyAttribute", sh_ct_font);
+    register_shim("_CTFontManagerCreateFontDescriptorFromData", sh_ct_font);
+    register_shim("_CTFontCollectionCreateFromAvailableFonts", sh_ct_font);
+    register_shim("_CTFontManagerCopyAvailableFontFamilyNames", sh_ct_families);
+    register_shim("_CTFontGetSymbolicTraits", sh_ct_traits);
+    register_shim("_CTFontManagerRegisterFontsForURL", sh_ct_register);
+    register_shim("_IOPMAssertionCreateWithDescription", sh_iopm);
+    register_shim("_CGDisplayIOServicePort", sh_display_service);
+    register_shim("_IODisplayCreateInfoDictionary", sh_display_info);
     register_shim("__ZNSt3__119__thread_local_dataEv", sh_thread_local_data);
     register_shim("_uselocale", sh_ret1);
     register_shim("_newlocale", sh_ret1);
@@ -2463,13 +2927,15 @@ uint64_t make_vtable(const std::string& name) {
     g_data.emplace(name, d);
     uint64_t fn = resolve_symbol("___lb_vtable_slot", 0);
     auto* slots = reinterpret_cast<uint64_t*>(addr);
-    slots[0] = 0;
-    slots[1] = make_data_bytes(name + ".ti", 32);
-    for (int i = 2; i < kSlots; ++i) slots[i] = fn;
     // basic_ofstream / basic_ifstream place the virtual basic_ios at +0x1a0.
+    // A construction path also installs the vptr eight bytes higher, and
+    // then reads this word via vptr-24.
     uint64_t vbase = 0;
     if (name.find("basic_ofstream") != std::string::npos || name.find("basic_ifstream") != std::string::npos)
         vbase = 0x1a0;
+    slots[0] = 0;
+    slots[1] = make_data_bytes(name + ".ti", 32);
+    for (int i = 2; i < kSlots; ++i) slots[i] = fn;
     std::memcpy(reinterpret_cast<void*>(addr - 8), &vbase, 8);
     return addr;
 }
