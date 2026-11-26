@@ -677,6 +677,126 @@ bool generic_message(Guest& g, const char* sname) {
         write_rect(g, r[0], r[1], r[2], r[3]);
         return true;
     }
+    if (s == "setFrame:display:") {
+        double r[4];
+        read_arg_rect(g, r);
+        store_rect(g.x[0], r);
+        return true;
+    }
+    if (s == "isMiniaturized") {
+        g.x[0] = 0;
+        return true;
+    }
+    if (s == "isKeyWindow" || s == "isOpaque" || s == "supportsFamily:" || s == "supportsTextureSampleCount:") {
+        g.x[0] = 1;
+        return true;
+    }
+    if (s == "windowNumber" || s == "styleMask") {
+        g.x[0] = s == "windowNumber" ? 1 : 15;
+        return true;
+    }
+    if (s == "modifierFlags") {
+        g.x[0] = 0;
+        return true;
+    }
+    if (s == "contentsScale") {
+        double scale = 2;
+        std::memcpy(g.v[0], &scale, 8);
+        return true;
+    }
+    if (s == "mouseLocation") {
+        double z = 0;
+        std::memcpy(g.v[0], &z, 8);
+        std::memcpy(g.v[1], &z, 8);
+        return true;
+    }
+    if (s == "arrowCursor") {
+        g.x[0] = make_object("NSCursor");
+        return true;
+    }
+    if (s == "effectiveAppearance") {
+        g.x[0] = make_object("NSAppearance");
+        return true;
+    }
+    if (s == "sRGBColorSpace") {
+        g.x[0] = make_object("NSColorSpace");
+        return true;
+    }
+    if (s == "mainQueue") {
+        g.x[0] = make_object("NSOperationQueue");
+        return true;
+    }
+    if (s == "UUID") {
+        g.x[0] = make_string("00000000-0000-0000-0000-000000000001");
+        return true;
+    }
+    if (s == "name") {
+        g.x[0] = make_string("sans");
+        return true;
+    }
+    if (s == "layer" || s == "contentView") {
+        g.x[0] = make_object(s == "layer" ? "CALayer" : "NSView");
+        return true;
+    }
+    if (s == "CGColor") {
+        g.x[0] = make_object("CGColor");
+        return true;
+    }
+    if (s == "delegate" || s == "objectForKey:" || s == "objectForInfoDictionaryKey:") {
+        g.x[0] = 0;
+        return true;
+    }
+    if (s == "currentContext") {
+        g.x[0] = make_object("NSGraphicsContext");
+        return true;
+    }
+    if (s == "deviceDescription" || s == "dictionaryWithObjects:forKeys:count:") {
+        g.x[0] = make_object("NSDictionary");
+        return true;
+    }
+    if (s == "sharedAppleEventManager") {
+        g.x[0] = make_object("NSAppleEventManager");
+        return true;
+    }
+    if (s == "commandBufferWithDescriptor:") {
+        g.x[0] = make_object("MTLCommandBuffer");
+        return true;
+    }
+    if (s == "standardWindowButton:") {
+        g.x[0] = make_object("NSButton");
+        return true;
+    }
+    if (s == "bitmapData") {
+        static uint8_t* px = nullptr;
+        if (!px) px = static_cast<uint8_t*>(std::calloc(1280 * 720 * 4, 1));
+        g.x[0] = reinterpret_cast<uint64_t>(px);
+        return true;
+    }
+    if (s == "isZoomed") {
+        g.x[0] = 0;
+        return true;
+    }
+    if (s == "superview") {
+        g.x[0] = has_payload(g.x[0]) ? payload(g.x[0]).props["superview"] : 0;
+        return true;
+    }
+    if (s == "containsString:") {
+        std::string hay = has_payload(g.x[0]) ? payload(g.x[0]).str : "";
+        std::string needle = has_payload(g.x[2]) ? payload(g.x[2]).str : "";
+        g.x[0] = (!needle.empty() && hay.find(needle) != std::string::npos) ? 1 : 0;
+        return true;
+    }
+    if (s == "UUIDString") {
+        g.x[0] = make_string("00000000-0000-0000-0000-000000000001");
+        return true;
+    }
+    if (s == "setEventHandler:andSelector:forEventClass:andEventID:") return true;
+    if (s == "countByEnumeratingWithState:objects:count:" || s == "addObserver:forKeyPath:options:context:" ||
+        s == "addObserverForName:object:queue:usingBlock:" || s == "addLocalMonitorForEventsMatchingMask:handler:" ||
+        s == "registerForDraggedTypes:" || s == "addRepresentation:") {
+        g.x[0] = 0;
+        return true;
+    }
     return false;
 }
 
