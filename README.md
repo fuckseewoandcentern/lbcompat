@@ -21,6 +21,8 @@ cmake -S . -B /tmp/lbcompat-build -DCMAKE_CXX_COMPILER=g++
 cmake --build /tmp/lbcompat-build -j
 ```
 
+也可以在 GitHub 上构建。打开本仓库的 Actions，选择「手动构建」，再点 Run workflow。可选 Release 或 Debug，以及要不要跑测试。跑完后，该次运行的 Artifacts 里有 `lbcompat` 和 `lb-mpris-bridge`。没有 LyricsBlossom 本体时，Mach-O 和启动测试会跳过。
+
 没有显示、也没有硬件 Vulkan 时，先指定 lavapipe：
 
 ```bash
